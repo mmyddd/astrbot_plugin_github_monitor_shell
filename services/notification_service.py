@@ -12,6 +12,7 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.astr_message_event import MessageSesion
 from astrbot.core.star import StarTools
 
+from ..utils.text_utils import split_long_message
 from ..utils.time_utils import format_commit_datetime
 
 __all__ = ["NotificationService", "format_commit_datetime"]
@@ -51,6 +52,8 @@ class NotificationService:
         image_cfg = (config or {}).get("image_output", {}) or {}
         self.commit_output_format = image_cfg.get("commit_output_format", "text")
         self.enable_base64_image = bool(image_cfg.get("enable_base64_image", True))
+        # 单条纯文本消息安全长度：超过后自动拆分为多条发送（QQ 对单条消息长度有限制）
+        self.message_max_length = int((config or {}).get("message_max_length", 2000) or 2000)
         self._ensure_data_dir()
 
     def _ensure_data_dir(self):
@@ -729,6 +732,22 @@ class NotificationService:
             return message
         return MessageChain().message(message)
 
+    def _split_text_chain(self, message_chain: MessageChain) -> List[MessageChain]:
+        """把超长的纯文本消息链拆分为多条，其他类型消息链（图文/图片等）原样返回"""
+        try:
+            if len(message_chain.chain) == 1 and isinstance(message_chain.chain[0], Comp.Plain):
+                text = message_chain.chain[0].text or ""
+                chunks = split_long_message(text, self.message_max_length)
+                if len(chunks) > 1:
+                    logger.info(
+                        f"消息长度 {len(text)} 超过安全长度 {self.message_max_length}，"
+                        f"已拆分为 {len(chunks)} 条依次发送"
+                    )
+                    return [MessageChain(chain=[Comp.Plain(c)]) for c in chunks]
+        except Exception as e:
+            logger.warning(f"拆分长消息时出错，按原消息发送: {str(e)}")
+        return [message_chain]
+
     async def _send_private_message(self, user_id, message):
         """通过 AstrBot 通用接口主动发送私聊消息
 
@@ -764,16 +783,7 @@ class NotificationService:
                 message_type=MessageType.FRIEND_MESSAGE,
                 session_id=user_id_str,
             )
-            message_chain = self._to_message_chain(message)
-            sent = await StarTools.send_message(session, message_chain)
-
-            if not sent:
-                error_msg = f"发送私聊消息失败: 找不到平台 {platform_id}，请检查平台是否已启动"
-                logger.error(error_msg)
-                return {"success": False, "message": error_msg}
-
-            logger.info(f"✅ 成功向 {user_id_str} 发送私聊消息")
-            return {"success": True}
+            return await self._send_by_session(session, message, target_desc=user_id_str)
         except Exception as e:
             error_msg = f"发送私聊消息失败: {str(e)}"
             logger.error(error_msg, exc_info=True)
@@ -841,13 +851,7 @@ class NotificationService:
                 message_type=MessageType.GROUP_MESSAGE,
                 session_id=group_id_str,
             )
-            sent = await StarTools.send_message(session, self._to_message_chain(message))
-            if not sent:
-                error_msg = f"发送群消息失败: 找不到平台 {platform_id}，请检查平台是否已启动"
-                logger.error(error_msg)
-                return {"success": False, "message": error_msg}
-            logger.info(f"✅ 成功向 QQ 群 {group_id_str} 发送消息")
-            return {"success": True}
+            return await self._send_by_session(session, message, target_desc=group_id_str)
         except Exception as e:
             error_msg = f"发送群消息失败: {str(e)}"
             logger.error(error_msg, exc_info=True)

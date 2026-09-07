@@ -19,6 +19,7 @@ from .services.onebot_direct import OneBotDirectSender
 from .services.template_manager import TemplateManager
 from .utils.cron_utils import cron_matches, get_next_run_time
 from .utils.markdown_utils import extract_image_urls
+from .utils.text_utils import split_long_message, truncate_text
 
 # 单条 Issues 动态通知最多补发的图片数量，防止刷屏
 MAX_ISSUE_IMAGES_PER_PUSH = 6
@@ -28,6 +29,9 @@ class GitHubMonitorPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         self.config = config or {}
+        # Issue 评论正文截断长度与单条消息安全长度（防止 QQ 消息过长导致发送失败）
+        self.max_comment_length = int(self.config.get("max_comment_length", 400) or 400)
+        self.message_max_length = int(self.config.get("message_max_length", 2000) or 2000)
         self.github_service = GitHubService(self.config.get("github_token", ""))
         plugin_data_dir = StarTools.get_data_dir("GitHub监控插件")
         # 文转图相关服务（模板目录：插件内置 templates/ + 数据目录自定义 templates/）
@@ -886,7 +890,9 @@ class GitHubMonitorPlugin(Star):
                 yield event.plain_result(f"✅ {username} 的所有仓库均无 open issues（共 {len(all_repos)} 个仓库）")
             else:
                 message += f"📊 共 {len(all_repos)} 个仓库，其中 {repos_with_issues} 个仓库有 open issues，共 {total_issues} 个"
-                yield event.plain_result(message)
+                # 仓库/issue 较多时消息可能超过 QQ 单条消息长度限制，分片发送
+                for chunk in split_long_message(message, self.message_max_length):
+                    yield event.plain_result(chunk)
 
         except Exception as e:
             logger.error(f"查询 issues 失败: {str(e)}")
