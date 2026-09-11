@@ -561,14 +561,24 @@ class GitHubMonitorPlugin(Star):
                     if self._is_commit_already_notified(repo_key, latest_sha, all_groups):
                         logger.info(f"仓库 {repo_key} 的提交 {latest_sha[:7]} 已经发送过通知，跳过")
                     else:
-                        # 发送通知
-                        await self.notification_service.send_commit_notification(
-                            repo_info, new_commits, notification_targets, all_groups,
-                            branch=actual_branch,
-                        )
-                        # 标记为已发送
-                        self._mark_commit_as_notified(repo_key, latest_sha, all_groups)
-                        logger.info(f"已标记仓库 {repo_key} 的提交 {latest_sha[:7]} 为已通知")
+                        # 合并转发模式：本轮只收集，待所有仓库检查完成后统一整合发送
+                        if self.notification_service.forward_merge_enabled:
+                            self.notification_service.queue_commit_notification(
+                                repo_info, new_commits, notification_targets, all_groups,
+                                branch=actual_branch, repo_key=repo_key,
+                            )
+                            logger.info(
+                                f"仓库 {repo_key} 的提交 {latest_sha[:7]} 已加入合并转发队列"
+                            )
+                        else:
+                            # 发送通知
+                            await self.notification_service.send_commit_notification(
+                                repo_info, new_commits, notification_targets, all_groups,
+                                branch=actual_branch,
+                            )
+                            # 标记为已发送
+                            self._mark_commit_as_notified(repo_key, latest_sha, all_groups)
+                            logger.info(f"已标记仓库 {repo_key} 的提交 {latest_sha[:7]} 为已通知")
 
                 # 更新数据
                 commit_data[repo_key] = new_commit  # 仍然只保存最新的提交SHA用于比较
@@ -584,9 +594,35 @@ class GitHubMonitorPlugin(Star):
         if removed_keys:
             self._save_commit_data(commit_data)
 
+        # 合并转发模式：把本轮收集到的 commit 通知整合成转发聊天记录发送，
+        # 并按发送结果标记提交为已通知（失败目标已进入待重试队列）
+        if self.notification_service.forward_merge_enabled:
+            await self._flush_forward_merge_notifications()
+
         logger.info(
             f"本轮检查完成：共 {len(configured_repo_keys)} 个仓库，{updated_count} 个有更新"
         )
+
+    async def _flush_forward_merge_notifications(self):
+        """把本轮收集到的 commit 通知整合成合并转发消息发送并标记已通知
+
+        无论部分目标是否发送失败，出队的提交都会被标记为已通知——失败的目标
+        已写入待重试队列，避免下一轮轮询重复收集导致重复推送。
+        """
+        try:
+            flushed_items = await self.notification_service.flush_commit_notifications()
+        except Exception as e:
+            logger.error(f"整合发送合并转发 commit 通知失败: {str(e)}", exc_info=True)
+            return
+
+        for item in flushed_items:
+            repo_key = item.get("repo_key")
+            new_commits = item.get("new_commits") or []
+            latest_sha = new_commits[0].get("sha", "") if new_commits else ""
+            if not repo_key or not latest_sha:
+                continue
+            self._mark_commit_as_notified(repo_key, latest_sha, item.get("group_targets") or [])
+            logger.info(f"已标记仓库 {repo_key} 的提交 {latest_sha[:7]} 为已通知（合并转发）")
 
     async def _check_repo_issues(self, owner: str, repo: str, extra_groups: List[str] = None):
         """检测单个项目仓库的 Issues 动态
