@@ -12,6 +12,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.star import StarTools
 from .services.github_service import GitHubService
+from .utils.file_utils import write_json_atomic
 from .services.group_upload_service import GroupUploadService
 from .services.image_render_service import ImageRenderService
 from .services.notification_service import NotificationService, format_commit_datetime
@@ -82,8 +83,7 @@ class GitHubMonitorPlugin(Star):
     def _save_commit_data(self, data: Dict):
         """保存commit数据"""
         try:
-            with open(self.data_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            write_json_atomic(self.data_file, data)
         except Exception as e:
             logger.error(f"保存commit数据失败: {str(e)}")
 
@@ -101,8 +101,7 @@ class GitHubMonitorPlugin(Star):
     def _save_sent_notifications(self, data: Dict):
         """保存已发送通知记录"""
         try:
-            with open(self.sent_notifications_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            write_json_atomic(self.sent_notifications_file, data)
         except Exception as e:
             logger.error(f"保存已发送通知记录失败: {str(e)}")
 
@@ -120,8 +119,7 @@ class GitHubMonitorPlugin(Star):
     def _save_issues_snapshot(self, data: Dict):
         """保存 issues 快照"""
         try:
-            with open(self.issues_snapshot_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            write_json_atomic(self.issues_snapshot_file, data)
         except Exception as e:
             logger.error(f"保存 issues 快照失败: {str(e)}")
 
@@ -139,8 +137,7 @@ class GitHubMonitorPlugin(Star):
     def _save_issues_push_log(self, data: Dict):
         """保存推送日志"""
         try:
-            with open(self.issues_push_log_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            write_json_atomic(self.issues_push_log_file, data)
         except Exception as e:
             logger.error(f"保存 issues 推送日志失败: {str(e)}")
 
@@ -164,8 +161,7 @@ class GitHubMonitorPlugin(Star):
     def _save_repo_issues_state(self, data: Dict):
         """保存项目仓库 Issues 动态监控状态"""
         try:
-            with open(self.repo_issues_state_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            write_json_atomic(self.repo_issues_state_file, data)
         except Exception as e:
             logger.error(f"保存项目仓库 Issues 状态失败: {str(e)}")
 
@@ -608,6 +604,9 @@ class GitHubMonitorPlugin(Star):
 
         无论部分目标是否发送失败，出队的提交都会被标记为已通知——失败的目标
         已写入待重试队列，避免下一轮轮询重复收集导致重复推送。
+
+        队列本身在发送前已清空并落盘（见 NotificationService.flush_commit_notifications），
+        因此恢复出来的条目即使已经用最新 SHA 标记过，也必须照常发送，否则通知永久丢失。
         """
         try:
             flushed_items = await self.notification_service.flush_commit_notifications()
@@ -621,7 +620,10 @@ class GitHubMonitorPlugin(Star):
             latest_sha = new_commits[0].get("sha", "") if new_commits else ""
             if not repo_key or not latest_sha:
                 continue
-            self._mark_commit_as_notified(repo_key, latest_sha, item.get("group_targets") or [])
+            group_targets = item.get("group_targets") or []
+            # 已通知只代表「已推送过」，不代表「通知已发出」：上一轮整合发送中途异常时，
+            # 提交数据可能已推进到该 SHA 而通知没发出去，恢复的条目必须照常发送。
+            self._mark_commit_as_notified(repo_key, latest_sha, group_targets)
             logger.info(f"已标记仓库 {repo_key} 的提交 {latest_sha[:7]} 为已通知（合并转发）")
 
     async def _check_repo_issues(self, owner: str, repo: str, extra_groups: List[str] = None):

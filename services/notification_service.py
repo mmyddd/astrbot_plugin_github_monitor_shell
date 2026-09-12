@@ -12,6 +12,7 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.astr_message_event import MessageSesion
 from astrbot.core.star import StarTools
 
+from ..utils.file_utils import write_json_atomic
 from ..utils.text_utils import split_long_message
 from ..utils.time_utils import format_commit_datetime
 
@@ -44,6 +45,11 @@ class NotificationService:
         self.onebot_sender = onebot_sender
         self.plugin_data_dir = StarTools.get_data_dir("GitHub监控插件")
         self.failed_notifications_file = os.path.join(self.plugin_data_dir, "failed_notifications.json")
+        # 合并转发待发送队列的落盘文件：队列在内存中的同时持久化，
+        # 保证进程崩溃 / 刷新异常后仍能恢复未发出的通知
+        self.pending_commit_notifications_file = os.path.join(
+            self.plugin_data_dir, "pending_forward_notifications.json"
+        )
         self.time_zone = (config or {}).get("time_zone", "Asia/Shanghai")
         self.time_format = (config or {}).get("time_format", "%Y-%m-%d %H:%M:%S")
         # 从配置中获取平台ID（高级选项），如果未配置则自动查找QQ系列平台
@@ -63,8 +69,11 @@ class NotificationService:
         self.forward_max_nodes = max(1, int(forward_cfg.get("max_nodes_per_message", 20) or 20))
         self.forward_fallback_to_normal = bool(forward_cfg.get("fallback_to_normal", True))
         # 待合并的 commit 通知队列：轮询期间入队，本轮检查结束后由 flush_commit_notifications 统一发送
+        # 队列同步落盘，启动时恢复上次未发送完的条目（见 _load_pending_commit_notifications）
         self._pending_commit_notifications: List[Dict] = []
         self._ensure_data_dir()
+        # 重启后自动补发上次因崩溃 / 异常而未发送完的通知
+        self._pending_commit_notifications = self._load_pending_commit_notifications()
 
     def _ensure_data_dir(self):
         """确保数据目录存在"""
@@ -241,6 +250,9 @@ class NotificationService:
                 "targets": self._normalize_target_list(targets),
                 "group_targets": self._normalize_target_list(group_targets),
                 "branch": n.get("branch"),
+                # 合并转发模式的重试元数据：决定该条目重试时走合并转发发送器
+                "forward_merge": bool(n.get("forward_merge", False)),
+                "forward_batch": bool(n.get("forward_batch", False)),
             }
             item["key"] = n.get("key") or self._build_notification_key(repo_info, new_commits)
             item["attempts"] = int(n.get("attempts", 0) or 0)
@@ -342,10 +354,9 @@ class NotificationService:
     def _save_failed_notifications(self, notifications: List):
         """保存发送失败的通知"""
         try:
-            with open(self.failed_notifications_file, 'w', encoding='utf-8') as f:
-                normalized = self._normalize_failed_notifications(notifications)
-                normalized = self._dedupe_failed_notifications(normalized)
-                json.dump(normalized, f, ensure_ascii=False, indent=2)
+            normalized = self._normalize_failed_notifications(notifications)
+            normalized = self._dedupe_failed_notifications(normalized)
+            write_json_atomic(self.failed_notifications_file, normalized)
         except Exception as e:
             logger.error(f"保存失败通知记录失败: {str(e)}")
 
@@ -357,6 +368,8 @@ class NotificationService:
 
         logger.info(f"尝试重新发送 {len(failed_notifications)} 条失败的通知")
         remaining_notifications = []
+        # 合并转发模式下失败的目标：按目标重新合并成批次后统一重试
+        forward_retry_entries: List[Dict] = []
 
         for notification in failed_notifications:
             notification_key = notification.get("key")
@@ -366,6 +379,14 @@ class NotificationService:
             # 获取最新commit信息，检查是否已经发送过
             repo_info = notification.get("repo_info", {})
             new_commits = notification.get("new_commits", [])
+
+            # 合并转发模式下失败的目标不能走普通逐条发送（会把一条合并前向消息拆成
+            # 多条普通消息），先收集起来，最后按目标重新合并成批次重试。
+            # 注意这里不查主发送记录：整合发送失败时调用方仍可能已把该提交标记为
+            # 已通知，条目还在待重试队列里就说明它没真正发出去，必须照常重试。
+            if notification.get("forward_merge") and notification.get("forward_batch"):
+                forward_retry_entries.append(notification)
+                continue
 
             # 检查是否已经在主发送记录中标记为已发送
             if self._is_already_sent_in_main_record(repo_info, new_commits, targets, group_targets):
@@ -390,6 +411,12 @@ class NotificationService:
                 self._mark_as_sent_in_main_record(repo_info, new_commits, targets, group_targets)
 
         # 保存仍然失败的通知
+        # 合并转发重试：同一目标的多条通知重新合并成一条转发记录发送
+        if forward_retry_entries:
+            remaining_notifications.extend(
+                await self._retry_forward_notifications(forward_retry_entries)
+            )
+
         self._save_failed_notifications(remaining_notifications)
         logger.info(f"重试后仍失败的通知数量: {len(remaining_notifications)}")
 
@@ -463,10 +490,66 @@ class NotificationService:
             if group_list and group_list not in sent_data[repo_key][latest_sha]:
                 sent_data[repo_key][latest_sha].append(group_list)
 
-            with open(sent_file, 'w', encoding='utf-8') as f:
-                json.dump(sent_data, f, ensure_ascii=False, indent=2)
+            write_json_atomic(sent_file, sent_data)
         except Exception as e:
             logger.error(f"标记通知为已发送失败: {str(e)}")
+
+    def _load_pending_commit_notifications(self) -> List[Dict]:
+        """从磁盘恢复合并转发待发送队列
+
+        队列在内存中的同时会落盘（见 _save_pending_commit_notifications）：进程
+        崩溃、或整合发送过程中抛出未处理异常时，提交数据可能已经推进到最新 SHA，
+        但通知还没发出去。启动时恢复这些条目并在本轮重新入队补发，避免通知永久丢失。
+        运行时状态（failed_targets 等）不入盘，恢复时重置为空。
+        """
+        try:
+            if not os.path.exists(self.pending_commit_notifications_file):
+                return []
+            with open(self.pending_commit_notifications_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.error(f"加载合并转发待发送队列失败: {str(e)}")
+            return []
+
+        if not isinstance(data, list):
+            return []
+
+        restored: List[Dict] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            repo_info = item.get("repo_info")
+            new_commits = item.get("new_commits")
+            if not isinstance(repo_info, dict) or not isinstance(new_commits, list) or not new_commits:
+                continue
+            targets = self._normalize_target_list(item.get("targets", []))
+            group_targets = self._normalize_target_list(item.get("group_targets", []))
+            if not targets and not group_targets:
+                continue
+            restored.append({
+                "repo_key": item.get("repo_key"),
+                "repo_info": repo_info,
+                "new_commits": new_commits,
+                "targets": targets,
+                "group_targets": group_targets,
+                "branch": item.get("branch"),
+                "failed_targets": [],
+                "failed_group_targets": [],
+            })
+
+        if restored:
+            logger.info(f"合并转发：已恢复 {len(restored)} 条上次未发送完的通知，将在本轮统一补发")
+        return restored
+
+    def _save_pending_commit_notifications(self):
+        """把合并转发待发送队列原子落盘（失败只记日志，不影响本轮推送）"""
+        try:
+            write_json_atomic(
+                self.pending_commit_notifications_file,
+                self._pending_commit_notifications,
+            )
+        except Exception as e:
+            logger.error(f"保存合并转发待发送队列失败: {str(e)}")
 
     # ------------------------------------------------------------------
     # 合并转发（以一条转发聊天记录承载本轮所有 commit 通知）
@@ -515,6 +598,8 @@ class NotificationService:
             "failed_targets": [],
             "failed_group_targets": [],
         })
+        # 入队即落盘：即使随后进程退出，队列也能在下次启动时恢复补发
+        self._save_pending_commit_notifications()
 
     async def flush_commit_notifications(self) -> List[Dict]:
         """把队列中收集到的 commit 通知整合成合并转发消息发送。
@@ -529,8 +614,11 @@ class NotificationService:
             ``group_targets``），调用方应据此把提交标记为已通知——即使部分目标
             发送失败，失败目标也会写入待重试队列，避免下轮重复入队造成重复推送。
         """
+        # 先清空内存队列，让落盘文件与「发送中/发送失败」的条目一一对应：
+        # 发送失败的目标会连同本条目重写回落盘文件，异常退出也不会丢失通知。
         pending = self._pending_commit_notifications
         self._pending_commit_notifications = []
+        self._save_pending_commit_notifications()
         if not pending:
             return []
 
@@ -555,14 +643,15 @@ class NotificationService:
         for item in pending:
             if not item["failed_targets"] and not item["failed_group_targets"]:
                 continue
-            key = item.get("repo_key") or self._build_notification_key(
-                item["repo_info"], item["new_commits"]
-            )
+            key = self._build_notification_key(item["repo_info"], item["new_commits"])
             failed_payloads.append({
                 "repo_info": item["repo_info"],
                 "new_commits": item["new_commits"],
                 "targets": item["failed_targets"],
                 "group_targets": item["failed_group_targets"],
+                # 标记来源为合并转发及其批次：重试时必须走合并转发发送器
+                "forward_merge": True,
+                "forward_batch": True,
                 "branch": item["branch"],
                 "key": self._build_notification_key(item["repo_info"], item["new_commits"]),
                 "attempts": 1,
@@ -629,6 +718,66 @@ class NotificationService:
             f"✅ 成功向 {target_str} 发送合并转发：{len(chains)} 条转发记录，"
             f"共 {len(items)} 个 commit 节点"
         )
+
+    async def _retry_forward_notifications(self, entries: List[Dict]) -> List[Dict]:
+        """重试合并转发模式下失败的目标（按目标重新合并成一个批次发送）
+
+        每条待重试条目只保留了自己失败的目标；同一目标在多条条目里都可能出现，
+        这里先按 (是否群聊, 目标) 归并回批次，再用合并转发发送器重发一次，
+        使重试保持与首次发送一致的「一个目标一条转发记录」形态，而不是拆成多条
+        普通消息。发送后仍失败的目标会被更新回各自的条目。
+
+        Args:
+            entries: 待重试的失败通知条目（含 forward_merge / forward_batch 元数据）。
+
+        Returns:
+            仍然失败、需要继续留在重试队列中的条目列表。
+        """
+        logger.info(f"合并转发：尝试重试 {len(entries)} 条失败通知的待重试目标")
+
+        # 从磁盘恢复的条目没有 failed_* 字段（_normalize_failed_notifications 不落盘
+        # 运行时状态），而发送失败时会由 _mark_target_failed 写入，这里先补齐。
+        for entry in entries:
+            entry["failed_targets"] = []
+            entry["failed_group_targets"] = []
+
+        # 保持条目顺序稳定，便于按目标还原原始节点顺序
+        index_by_id = {id(entry): index for index, entry in enumerate(entries)}
+        grouped: Dict[tuple, List[Dict]] = {}
+        for entry in entries:
+            for target in entry.get("targets", []):
+                grouped.setdefault((False, target), []).append(entry)
+            for target in entry.get("group_targets", []):
+                grouped.setdefault((True, target), []).append(entry)
+
+        for (is_group, target), items in grouped.items():
+            items = sorted(items, key=lambda x: index_by_id.get(id(x), 0))
+            try:
+                await self._send_merged_forward(is_group, target, items)
+            except Exception as e:
+                logger.error(f"合并转发重试发送到 {target} 出错: {str(e)}", exc_info=True)
+                self._mark_target_failed(is_group, target, items)
+
+        still_failed: List[Dict] = []
+        for entry in entries:
+            failed_targets = self._merge_unique(entry.get("failed_targets", []), [])
+            failed_group_targets = self._merge_unique(entry.get("failed_group_targets", []), [])
+            if not failed_targets and not failed_group_targets:
+                # 重试成功：与首次发送成功一致，标记为该批次已通知的目标
+                self._mark_as_sent_in_main_record(
+                    entry.get("repo_info", {}),
+                    entry.get("new_commits", []),
+                    entry.get("targets", []),
+                    entry.get("group_targets", []),
+                )
+                continue
+            entry["targets"] = failed_targets
+            entry["group_targets"] = failed_group_targets
+            entry["attempts"] = int(entry.get("attempts", 0) or 0) + 1
+            still_failed.append(entry)
+
+        logger.info(f"合并转发：重试后仍有 {len(still_failed)} 条通知存在失败目标")
+        return still_failed
 
     @staticmethod
     def _mark_target_failed(is_group: bool, target: str, items: List[Dict]):
